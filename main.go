@@ -4,14 +4,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 var CLI struct {
 	Listen   string `help:"Listen address" default:":99"`
 	Hastebin string `help:"haste-server URL" placeholder:"https://ptero.co"`
+	Limit    int    `help:"Maximum size per paste" default:"131072"` // 131072 = 128 * 1024 (128 KiB)
 }
 
 func main() {
@@ -65,6 +67,13 @@ func main() {
 	slog.LogAttrs(ctx, slog.LevelInfo, "shutting down...")
 }
 
+// getListener returns the net.Listener to listen on.
+//
+// This function will automatically detect if we are running under systemd with a socket,
+// so we can "bind" to privileged ports without needing any privileges ourselves.
+//
+// If we are not running with a systemd socket activation, we will bind to the address set by
+// `CLI.Listen`.
 func getListener(ctx context.Context) (net.Listener, error) {
 	listeners, err := systemd.Listeners()
 	if err != nil {
@@ -76,11 +85,14 @@ func getListener(ctx context.Context) (net.Listener, error) {
 	return (&net.ListenConfig{}).Listen(ctx, "tcp", CLI.Listen)
 }
 
+// Server is responsible for listening for incoming connections, reading data, and forwarding it
+// to a haste-server.
 type Server struct {
 	listener net.Listener
 	haste    *haste.Client
 }
 
+// NewServer returns a new server using the provided listener and haste-server client.
 func NewServer(l net.Listener, h *haste.Client) *Server {
 	return &Server{
 		listener: l,
@@ -88,6 +100,7 @@ func NewServer(l net.Listener, h *haste.Client) *Server {
 	}
 }
 
+// Run runs the server, listening for incoming connections on the server's listener.
 func (s *Server) Run(ctx context.Context) error {
 	slog.LogAttrs(ctx, slog.LevelInfo, "listening for incoming connections...")
 	for {
@@ -106,6 +119,7 @@ func (s *Server) Run(ctx context.Context) error {
 				break
 			}
 
+			// Handle the connection in the background.
 			go func(ctx context.Context, conn net.Conn) {
 				if err := s.handle(ctx, conn); err != nil {
 					slog.LogAttrs(ctx, slog.LevelWarn, "error while handling connection", slog.Any("err", err))
@@ -115,25 +129,60 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+// handle handles an incoming connection from the listener.
 func (s *Server) handle(ctx context.Context, conn net.Conn) error {
 	slog.LogAttrs(ctx, slog.LevelInfo, "new connection")
 	defer slog.LogAttrs(ctx, slog.LevelInfo, "connection closed")
 	defer conn.Close()
 
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
+	// buf is all the data read from the connection.
+	var buf bytes.Buffer
+	// tmp is used to read smaller chunks of data from the connection.
+	tmp := make([]byte, 1024)
+	for {
+		// Reset the read deadline on each iteration, this functions as a timeout for each read.
+		if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+
+		n, err := conn.Read(tmp)
+		if err != nil {
+			// Normally you would wait for an io.EOF here, but netcat doesn't send an EOF when it's
+			// finished, so we just have to assume that it finished sending data after a timeout
+			// is reached.
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if buf.Len() < 1 {
+					slog.LogAttrs(ctx, slog.LevelInfo, "no data received from client before connection timed out")
+					return nil
+				}
+
+				// Got data from client, break.
+				break
+			}
+		}
+
+		buf.Write(tmp[:n])
+		if buf.Len() > CLI.Limit {
+			if err := conn.SetWriteDeadline(time.Now().Add(1 * time.Second)); err != nil {
+				return fmt.Errorf("failed to set write deadline: %w", err)
+			}
+			// TODO: it would be nice if we could pretty print the limit rather than always sending
+			// it as the number of bytes.
+			_, err = conn.Write([]byte("Pastes may not exceed " + strconv.Itoa(CLI.Limit) + " bytes of data"))
+			return err
+		}
 	}
 
-	r, err := s.haste.Paste(ctx, io.LimitReader(conn, 1024))
+	// Send the data to the haste-server.
+	r, err := s.haste.Paste(ctx, &buf)
 	if err != nil {
 		return fmt.Errorf("failed to forward data to hastebin: %w", err)
 	}
 
-	url := []byte(s.haste.URL)
-	key := []byte(r.Key)
-
 	// Stupidly, but efficiently do byte slice copies to combine the URL and Key into a single
 	// URL to write back to the client.
+	url := []byte(s.haste.URL)
+	key := []byte(r.Key)
 	res := make([]byte, len(url)+len(key)+2)
 	n := copy(res, url)
 	res[n] = '/'
