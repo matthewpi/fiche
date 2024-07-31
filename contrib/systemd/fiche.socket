@@ -1,0 +1,9 @@
+[Unit]
+Description=fiche
+
+[Socket]
+BindIPv6Only=both
+ListenStream=99
+
+[Install]
+WantedBy=sockets.target
