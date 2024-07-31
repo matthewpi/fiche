@@ -17,6 +17,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/matthewpi/fiche/internal/haste"
+	"github.com/matthewpi/fiche/internal/systemd"
 )
 
 var CLI struct {
@@ -42,8 +43,7 @@ func main() {
 		return
 	}
 
-	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "tcp", CLI.Listen)
+	listener, err := getListener(ctx)
 	if err != nil {
 		slog.LogAttrs(ctx, slog.LevelError, "failed to start listener", slog.Any("err", err))
 		os.Exit(1)
@@ -63,6 +63,17 @@ func main() {
 
 	<-ctx.Done()
 	slog.LogAttrs(ctx, slog.LevelInfo, "shutting down...")
+}
+
+func getListener(ctx context.Context) (net.Listener, error) {
+	listeners, err := systemd.Listeners()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get systemd listeners: %w", err)
+	}
+	if len(listeners) == 1 {
+		return listeners[0], nil
+	}
+	return (&net.ListenConfig{}).Listen(ctx, "tcp", CLI.Listen)
 }
 
 type Server struct {
