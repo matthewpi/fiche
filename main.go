@@ -131,8 +131,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 // handle handles an incoming connection from the listener.
 func (s *Server) handle(ctx context.Context, conn net.Conn) error {
-	slog.LogAttrs(ctx, slog.LevelInfo, "new connection")
-	defer slog.LogAttrs(ctx, slog.LevelInfo, "connection closed")
+	remoteAddr := conn.RemoteAddr().String()
+	slog.LogAttrs(ctx, slog.LevelInfo, "new connection", slog.Any("remote_addr", remoteAddr))
+	defer slog.LogAttrs(ctx, slog.LevelInfo, "connection closed", slog.Any("remote_addr", remoteAddr))
 	defer conn.Close()
 
 	// buf is all the data read from the connection.
